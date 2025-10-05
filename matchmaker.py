@@ -3,47 +3,116 @@ import streamlit as st
 import plotly.express as px
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from langchain_community.llms import Ollama
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
 
+from huggingface_hub import hf_hub_download
+from langchain_community.chat_models import ChatLlamaCpp
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# Streamlit page config
 st.set_page_config(page_title="Drug Repurposing Matchmaker", layout="wide")
 
 # ---------------------------
-# 1. Query LLM using LangChain Ollama
+# 0) Config via Streamlit secrets / env
 # ---------------------------
-def query_ollama(prompt, model="llama2"):
+HF_TOKEN = st.secrets.get("HUGGINGFACE_TOKEN")
+HF_REPO_ID = st.secrets.get("HF_REPO_ID", "TheBloke/Llama-2-7B-Chat-GGUF")
+HF_FILENAME = st.secrets.get("HF_FILENAME", "llama-2-7b-chat.Q4_K_M.gguf")
+
+# Optional tuning
+LLM_CTX = int(st.secrets.get("LLM_CTX", 4096))
+LLM_TEMPERATURE = float(st.secrets.get("LLM_TEMPERATURE", 0.7))
+LLM_MAX_TOKENS = int(st.secrets.get("LLM_MAX_TOKENS", 256))
+LLM_N_GPU_LAYERS = int(st.secrets.get("LLM_N_GPU_LAYERS", 0))  # >0 only if your wheel supports Metal/CUDA
+LLM_N_THREADS = int(st.secrets.get("LLM_N_THREADS", 0))        # 0 = auto
+
+# ---------------------------
+# 1) Download (or reuse cached) GGUF from Hugging Face
+# ---------------------------
+@st.cache_resource(show_spinner="Downloading model from Hugging Face...")
+def get_model_path() -> str:
+    """
+    Downloads the GGUF model file (resumes + caches).
+    Returns the local path to the file.
+    """
+    if HF_TOKEN is None and ("meta-llama" in HF_REPO_ID or "Llama-2" in HF_REPO_ID):
+        raise RuntimeError(
+            "HUGGINGFACE_TOKEN is required for gated repos. "
+            "Add it to Streamlit secrets."
+        )
+
+    path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=HF_FILENAME,
+        token=HF_TOKEN,              # uses token for gated repos; None is fine for open repos
+        local_files_only=False,
+        resume_download=True
+    )
+    return path
+
+# ---------------------------
+# 2) Load the llama.cpp model once
+# ---------------------------
+@st.cache_resource(show_spinner="Loading LLM…")
+def load_llm(model_path: str) -> ChatLlamaCpp:
+    return ChatLlamaCpp(
+        model_path=model_path,
+        n_ctx=LLM_CTX,
+        n_gpu_layers=LLM_N_GPU_LAYERS,
+        n_threads=LLM_N_THREADS,
+        temperature=LLM_TEMPERATURE,
+        verbose=False,
+        # You can also set stop=["</s>", "User:", "Assistant:"] if needed
+        max_tokens=LLM_MAX_TOKENS,  # default cap; you can change per session via secrets
+    )
+
+# ---------------------------
+# 3) Build the LangChain pipeline
+# ---------------------------
+SYSTEM_MSG = "You are a helpful, concise assistant."
+prompt_tmpl = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_MSG),
+    ("user", "{input}")
+])
+
+@st.cache_resource(show_spinner=False)
+def get_chain(_llm: ChatLlamaCpp):
+    # simple chain: prompt -> model -> string
+    return prompt_tmpl | _llm | StrOutputParser()
+
+# ---------------------------
+# 4) Query helper (drop-in function)
+# ---------------------------
+def query_ollama(prompt_text: str, max_new_tokens: int = None) -> str:
+    """
+    Torch-free, no-Ollama query using LangChain + llama.cpp.
+    If max_new_tokens is given, we recreate a lightweight chain with that limit.
+    """
     try:
-        # Initialize Ollama via LangChain
-        llm = Ollama(
-            model=model,
-            base_url="http://localhost:11434",  # Local Ollama instance
-            temperature=0.3,
-            num_predict=500  # Limit response length
-        )
-        
-        # Create a prompt template for better responses
-        prompt_template = PromptTemplate(
-            input_variables=["query"],
-            template="""You are a biomedical expert specializing in drug repurposing. 
-            Provide a clear, concise explanation about drug repositioning opportunities.
-            
-            Question: {query}
-            
-            Please explain in simple terms why this drug might work for this disease, 
-            focusing on biological mechanisms and clinical potential.
-            
-            Answer:"""
-        )
-        
-        # Create and run the chain
-        chain = LLMChain(llm=llm, prompt=prompt_template)
-        response = chain.run(query=prompt)
-        
-        return response.strip()
-        
+        model_path = get_model_path()
+        llm = load_llm(model_path)
+
+        if max_new_tokens is not None and max_new_tokens != LLM_MAX_TOKENS:
+            # For per-call token limits, create a shallow new llm wrapper
+            llm_dynamic = ChatLlamaCpp(
+                model_path=model_path,
+                n_ctx=LLM_CTX,
+                n_gpu_layers=LLM_N_GPU_LAYERS,
+                n_threads=LLM_N_THREADS,
+                temperature=LLM_TEMPERATURE,
+                verbose=False,
+                max_tokens=max_new_tokens,
+            )
+            chain = prompt_tmpl | llm_dynamic | StrOutputParser()
+            return chain.invoke({"input": prompt_text}).strip()
+
+        # Default: use cached chain
+        chain = get_chain(llm)
+        return chain.invoke({"input": prompt_text}).strip()
+
     except Exception as e:
-        return f"(LLM unavailable) Mock narrative: Unable to connect to Ollama. Please ensure Ollama is running locally with 'ollama serve'"
+        return f"(LLM unavailable) Mock narrative: {str(e)}"
+
 
 # ---------------------------
 # 2. Load Kaggle Drug Repositioning CSVs

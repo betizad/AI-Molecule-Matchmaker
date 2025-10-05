@@ -1,6 +1,7 @@
-pandas==2.3.3
-plotly==6.3.1
-prompt-toolkit==3.0.3
-scikit-learn==1.7.2
-langchain==0.2.12
-langchain-community==0.2.11
+pandas>=2.3.3,<3.0.0
+plotly>=6.3.1,<7.0.0
+prompt-toolkit>=3.0.3,<4.0.0
+scikit-learn>=1.7.2,<2.0.0
+langchain==0.3.27
+langchain-community==0.3.30
+# llama-cpp-python==0.3.16
